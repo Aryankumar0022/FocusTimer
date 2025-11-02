@@ -1,0 +1,448 @@
+1 — High level goals (Android-only)
+
+Core: fast, low-friction focus timer + local encrypted history + distraction tracking (Android-capable) + end-of-session reflection.
+
+Principles: local-first (default), privacy-first, battery-efficient, survive reboots & app kills, minimal permissions (explicit consent), clear user prompts for sensitive APIs.
+
+MVP scope (Android):
+
+Start/Pause/End timer (Pomodoro presets + custom).
+
+Foreground service for timer + persistent notification.
+
+Local encrypted DB (Room + SQLCipher/EncryptedFile where needed).
+
+Manual “distracted” button + automatic app-usage distraction tracking via UsageStatsManager + optional AccessibilityService for richer events (explicit opt-in).
+
+Reflection prompt at end of session + mood tag.
+
+History view + export CSV/JSON.
+
+Settings (Do Not Disturb integration, notification channel, account optional).
+
+Crash & telemetry (opt-in).
+
+2 — Team & workflow (Android-focused)
+
+Suggested small cross-functional team:
+
+Product Lead: requirements, acceptance criteria.
+
+Android Lead (Kotlin): architecture, code review.
+
+Android Engineer(s) (1–2): UI, service, DB, integration.
+
+Designer: screens, motion, accessibility.
+
+QA/Tester: unit/integration/E2E on device farm.
+
+Optional Backend Engineer: if you later add cloud sync.
+
+Use: GitHub repo, trunk-based, PR + code review, 2-week sprints.
+
+3 — Technical architecture (Android-only)
+
+App: Kotlin, MVVM (Android Jetpack: ViewModel, LiveData / StateFlow), Jetpack Compose UI (recommended) or XML.
+
+Local DB: Room + SQLCipher or SQLCipher via net.zetetic:android-database-sqlcipher for encrypted DB.
+
+Repository pattern: Repository → Room DAOs → ViewModels.
+
+Foreground timer: ForegroundService with ForegroundServiceType.TIMER and persistent Notification.
+
+Work & Resilience: WorkManager + AlarmManager for precise wake handling if needed; handle Doze/Do-Not-Disturb.
+
+Distraction tracking: UsageStatsManager (primary) + optional AccessibilityService (advanced events, app/window changes). Use UsageStats for app open foreground events aggregated.
+
+Permissions & Privacy: Request PACKAGE_USAGE_STATS via system settings screen (user must enable). If using AccessibilityService, show explicit onboarding and clear fallbacks.
+
+Testing: Unit tests, Robolectric where appropriate, Espresso for UI, Firebase Test Lab for device matrix.
+
+CI/CD: GitHub Actions → build → Firebase Test Lab → fastlane to Play Console (internal track) for beta.
+
+4 — Android-specific constraints & decisions
+
+UsageStatsManager: Only available when user enables “Usage access” in Settings. You must send the user to the Settings page for this permission. It gives aggregated foreground app usage (sufficient for distraction counts).
+
+AccessibilityService: More intrusive; can read window content & detect app opens reliably. Must justify in Play Store privacy and follow policy — use only if user explicitly opts in and explain exact purpose.
+
+Background execution limits: Use ForegroundService for timers so notifications are reliable. WorkManager for any scheduled background tasks (e.g., periodic sync).
+
+Battery / Doze: prefer high-efficiency timers; avoid busy loops. Use AlarmManager with exact alarms only when justified.
+
+App blocking: Avoid trying to programmatically block apps (not fully possible without device admin/MDM). Instead, present overlays / suggestions or use Accessibility to auto-focus, but be cautious with Play policies.
+
+5 — Permissions & manifest (what you’ll prompt users for)
+
+android.permission.FOREGROUND_SERVICE — for timer service.
+
+android.permission.USE_EXACT_ALARM — if you need exact alarms on Android 12+ (explain to user why).
+
+android.permission.POST_NOTIFICATIONS — Android 13+ for notification permission prompt.
+
+PACKAGE_USAGE_STATS — special permission: open Settings panel for user to enable.
+
+Accessibility service declaration (if implemented) — user must enable in Settings.
+
+No network permissions required for MVP (local-first). If sync added: INTERNET.
+
+Example manifest entries (snippets):
+
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+<!-- Special permission handled by Settings intent. -->
+
+
+Declare service:
+
+<service
+    android:name=".service.FocusTimerService"
+    android:exported="false"
+    android:foregroundServiceType="media|connectedDevice|location|dataSync|phoneCall|microphone|camera|gps|location|location" />
+
+
+(Only include appropriate foregroundServiceType; timer is logically used with media if using vibration/sound. Use the minimal type allowed.)
+
+6 — Data model (Room entities)
+
+Use Room with SQLCipher for encryption. Example entities:
+
+Session entity:
+
+@Entity(tableName = "sessions")
+data class Session(
+  @PrimaryKey val id: String = UUID.randomUUID().toString(),
+  val startedAt: Instant,
+  val endedAt: Instant? = null,
+  val durationSec: Long? = null, // computed
+  val taskTitle: String?,
+  val tagsJson: String?, // JSON string for tags
+  val distractedCount: Int = 0,
+  val reflection: String?, // encrypted at DB-level (SQLCipher covers)
+  val mood: String? // "productive","distracted","mixed"
+)
+
+
+Event (usage events):
+
+@Entity(tableName = "events")
+data class Event(
+  @PrimaryKey val id: String = UUID.randomUUID().toString(),
+  val sessionId: String?,
+  val eventType: String, // "app_foreground","manual_distract"
+  val packageName: String?,
+  val timestamp: Instant
+)
+
+
+DAO samples (abridged) and Repository patterns follow standard Room patterns.
+
+7 — Key Android components (detailed steps + snippets)
+7.1 Foreground timer service (reliable while app backgrounded)
+
+Purpose: keep timer running; show persistent notification; allow pause/resume/end from notification.
+
+Implement as ForegroundService + Timer logic inside or using CountDownTimer / Coroutine + SystemClock.elapsedRealtime() calculations for resilience across kills.
+
+Example (simplified):
+
+class FocusTimerService : LifecycleService() {
+  companion object {
+    const val NOTIF_CHANNEL = "focusflow_timer"
+  }
+
+  private var endTimeMs: Long = 0L
+  private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    // parse action: start/pause/resume/end
+    startForeground(1, buildNotification(remainingMs()))
+    scope.launch {
+      while (isActive && remainingMs() > 0) {
+        delay(1000)
+        updateNotification(remainingMs())
+      }
+      if (remainingMs() <= 0) onTimerFinished()
+    }
+    return START_STICKY
+  }
+
+  private fun remainingMs(): Long = maxOf(0L, endTimeMs - SystemClock.elapsedRealtime())
+  // buildNotification(), updateNotification(), onTimerFinished() -> save session end
+}
+
+
+Notes:
+
+Persist endTimeMs to local DB/SharedPreferences when starting so that if service is killed+restarted you can resume correctly.
+
+Always call startForeground() within 5 seconds of service start.
+
+7.2 Notifications & Do Not Disturb
+
+Create notification channel(s).
+
+For DnD integration: request NotificationManager.isNotificationPolicyAccessGranted() if you want to modify Do Not Disturb (sensitive; explain to user). Usually better to post notifications and suggest “FocusFlow silence other notifications” via DnD suggestion, not programmatic changes.
+
+7.3 UsageStatsManager (distraction tracking)
+
+Guide user to enable Usage Access via:
+
+startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+
+
+Query usage stats via UsageStatsManager.queryEvents(beginTime, endTime) to see foreground transitions and count events where packageName != your app → count as distractions.
+
+Example usage:
+
+val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+val events = usm.queryEvents(startMs, endMs)
+val event = UsageEvents.Event()
+while (events.hasNextEvent()) {
+   events.getNextEvent(event)
+   if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+      val pkg = event.packageName
+      // increment distraction event if pkg != your package
+   }
+}
+
+
+Caveat: granularity is limited (depends on OEM), but generally reliable for foreground app switches.
+
+7.4 AccessibilityService (optional)
+
+If you need more precise or immediate detection of app opens or want to show overlays, implement an AccessibilityService subclass.
+
+Must show exact reasons on onboarding. Play Store reviewers will check. Keep usage minimal & transparent.
+
+Example manifest registration and service with AccessibilityServiceInfo.
+
+7.5 Persisting sessions + export
+
+On end of session, compute durationSec, save Session entity + recorded Events.
+
+Implement an ExportManager that serializes selected sessions to CSV (safest) or JSON, and uses a Share Intent to let user export.
+
+8 — Encryption & key management
+
+Use SQLCipher to encrypt the Room DB. Alternative: use AndroidX Security + EncryptedFile for secrets and use that to store a symmetric key for DB encryption.
+
+Key generation approach:
+
+Generate a random AES-256 key.
+
+Wrap/Store it in the Android Keystore (use KeyStore with AES/GCM or RSA to wrap).
+
+Open SQLCipher DB with that key.
+
+If user sets a passphrase for cloud sync, derive key via PBKDF2 (but keep default local encryption automatic).
+
+Sample flow using EncryptedSharedPreferences to store small secrets; for DB, use SQLCipher integration.
+
+9 — Telemetry, privacy, & logging (Android considerations)
+
+Default: telemetry OFF. Offer opt-in during onboarding with explicit explanation.
+
+If enabled, only send hashed user id + aggregated numeric metrics (no reflections or free text).
+
+Use Sentry (errors) with PII scrubbed; use user consent for forwarding stack traces that might contain user content.
+
+Local logs: avoid writing reflections to any logs.
+
+10 — UX & onboarding (Android specifics)
+
+On first open:
+
+Short mission screen: what FocusFlow does; privacy statement.
+
+Ask permission to post notifications (Android 13+).
+
+Offer to enable Usage Access with an explainer modal: show screenshots of the Settings screen and what enabling allows (clear purpose).
+
+If AccessibilityService is the route: separate screen with deep explanation and clear opt-in.
+
+Quick start wizard: choose default preset (25/50/90), show sample session.
+
+Keep onboarding skippable, but show privacy and explain where data is stored.
+
+11 — Testing & QA (Android-focused)
+
+Unit tests: ViewModels, Repository logic, timer math (use Robolectric or JUnit).
+
+UI tests: Compose Test utilities or Espresso for XML UIs. Tests for start/pause/end flows, notification actions.
+
+E2E tests: Android Test Orchestrator + Firebase Test Lab (real devices).
+
+Accessibility tests: use AccessibilityTestRule and manual checks (talkback).
+
+Performance: test battery usage with Android Profiler; ensure foreground service + CPU usage minimal.
+
+Permissions flows: automated tests for flows where user denies vs. grants usage access and notification permission.
+
+Sample test case list:
+
+Start a 25m session → background app → session continues → notification shows remaining time.
+
+Kill app process → restart device → historical session intact (ended or resumed behaviour confirmed).
+
+Toggle usage access OFF mid-session → app should gracefully fall back to manual logging and log an event for missing permission.
+
+Export sessions to CSV and open in external app.
+
+12 — CI/CD & release (Android)
+
+Build system: Gradle Kotlin DSL.
+
+CI pipeline (GitHub Actions):
+
+Lint, detekt, ktlint.
+
+Unit tests, instrumentation tests (Firebase Test Lab integration).
+
+Build artifacts (apk/aab).
+
+Optionally sign with secure keys from GitHub Secrets and upload to Play Console internal track via fastlane supply or Google Play Developer API.
+
+Signing keys: store in secure secrets; for debug use debug keystore.
+
+Beta rollout plan: Internal -> Closed testing (friends) -> Open beta -> staged rollout (5% -> 25% -> 100%).
+
+Play Store metadata: Privacy policy URL, contact email, declare data collection (Usage access explicit), include a short privacy snippet about local storage & opt-in telemetry.
+
+13 — Play Store policy & privacy copy (short sample)
+
+Privacy screen (onboarding):
+
+FocusFlow stores your session data on your device by default. If you enable cloud sync, session reflections are end-to-end encrypted using a passphrase you provide. Usage Access (optional) is used solely to detect foreground app switches so FocusFlow can count distractions — this data remains on your device unless you opt-in to share aggregated metrics.
+
+Include a full privacy policy on a hosted URL (GitHub Pages is fine for MVP) describing how usage access and optional telemetry work, and provide a contact email for data deletion requests.
+
+14 — Instrumentation & analytics events (opt-in)
+
+Keep small and descriptive:
+
+onboarding_complete {timestamp, usage_access_enabled: bool, accessibility_enabled: bool}
+
+session_start {id, timer_len_min, started_at}
+
+session_end {id, duration_sec, distracted_count}
+
+manual_distract {session_id}
+
+export_sessions {count}
+Hash any identifiers before sending.
+
+15 — Roadmap & milestones (8-week example sprint plan)
+
+Week 0–1: Spec + Designer mocks + repo scaffold
+
+Deliverables: PRD (1-pager), 6 core screens (Onboard, Home, Timer, During, End, History), repo setup.
+
+Week 1–3: Core features (local)
+
+Implement ForegroundService timer, local DB (Room), start/pause/end flows, persistent notification, reflection prompt, basic history view.
+
+Week 3–5: Distraction tracking + persistence
+
+Add UsageStats integration + UI consent flow, event logging, distracted count calculation, export CSV.
+
+Week 5–6: QA & polish
+
+Unit tests, instrumentation tests, fix edge cases (reboot, kills), accessibility improvements, performance tuning.
+
+Week 6–7: Beta release
+
+Build aab, upload internal test track, collect feedback, fix P0 bugs.
+
+Week 7–8: Launch prep
+
+Finalize privacy policy, Play Store listing, staged rollout.
+
+16 — Acceptance criteria (MVP)
+
+Timer can be started/paused/ended with home screen quick action < 2 taps.
+
+Timer runs reliably in background using ForegroundService; notification persists and has actions.
+
+Session saved to encrypted local DB with reflection and distracted count.
+
+Usage access consent flows work and produce distraction counts for typical app switches.
+
+Export to CSV works and data is correct.
+
+No high severity crashes on supported Android versions (recommend support API 21+ or 23+ as per team decision).
+
+Privacy screen shown and telemetry is off by default.
+
+17 — Example code snippets (ready to paste)
+Room entity & DAO (abridged)
+@Entity
+data class Session(
+  @PrimaryKey val id: String = UUID.randomUUID().toString(),
+  val startedAt: Long,
+  val endedAt: Long? = null,
+  val durationSec: Long? = null,
+  val taskTitle: String?,
+  val distractedCount: Int = 0,
+  val reflection: String?,
+  val mood: String?
+)
+
+@Dao
+interface SessionDao {
+  @Insert
+  suspend fun insert(session: Session)
+
+  @Query("SELECT * FROM Session ORDER BY startedAt DESC")
+  fun observeAll(): Flow<List<Session>>
+
+  @Query("UPDATE Session SET endedAt = :endedAt, durationSec = :durationSec WHERE id = :id")
+  suspend fun markEnded(id: String, endedAt: Long, durationSec: Long)
+}
+
+UsageStats query example
+fun countDistractions(context: Context, startMs: Long, endMs: Long, appPackage: String): Int {
+  val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+  val events = usm.queryEvents(startMs, endMs)
+  val event = UsageEvents.Event()
+  var count = 0
+  while (events.hasNextEvent()) {
+    events.getNextEvent(event)
+    if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND && event.packageName != appPackage) {
+       count++
+    }
+  }
+  return count
+}
+
+18 — Security checklist (implement before public launch)
+
+Encrypt Room DB with SQLCipher or ensure DB encryption key stored in Keystore.
+
+Use TLS for any network traffic if sync added.
+
+Scrub logs & stack traces of session reflections / PII.
+
+Provide data export & full wipe buttons in settings.
+
+Document data retention & deletion flow for users.
+
+19 — Useful libraries & tech decisions
+
+Jetpack Compose (UI), Kotlin Coroutines, Lifecycle, ViewModel, Room, WorkManager, Hilt (DI), Retrofit if backend later, SQLCipher or room-encryption wrapper, Activity KTX, Play Core for in-app updates (optional), Sentry for errors (opt-in), Firebase Test Lab for CI tests.
+
+20 — Immediate “doable now” checklist (what to start implementing this afternoon)
+
+Create repo skeleton (module app), set Kotlin + Compose, set up Hilt, Room dependencies.
+
+Implement FocusTimerService skeleton and Notification channel.
+
+Implement Session entity + SessionDao + Repository.
+
+Implement simple Home screen: quick start 25min → call service to start.
+
+Implement end-of-session flow to save session and show reflection dialog.
+
+Add Usage Access onboarding screen (button sends to ACTION_USAGE_ACCESS_SETTINGS).
+
+Add tests for timer math and DB save.
